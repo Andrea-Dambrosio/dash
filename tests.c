@@ -5,7 +5,8 @@
 #define TEST_MAX_ARGS 64
 
 // Function prototype from main.c
-int get_words(char *restrict str, int *restrict wcp, char **restrict words, int maxw);
+int get_words(char *_Nonnull restrict str, int *_Nullable restrict wcp, char **_Nonnull restrict words,
+              int maxw);
 
 /**
  * @brief Unit tests for get_words function.
