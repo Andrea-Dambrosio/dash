@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef TEST
+#include "tests.c"
+#endif
 #define MAXBUFSIZE 4096
 #define MAX_ARGS 1024
 
@@ -27,6 +30,7 @@
  * @param[in,out] str           Null terminated string to parse. Must be a mutable string.
  * @param[out]  wcp             Words inside the string
  * @param[out]  words           A pointer to an array of strings pre allocated.
+ * @param[in]   maxw            Size of the words array
  *
  * @return 0 on success
  * @return -1 on error
@@ -34,7 +38,6 @@
  * @warning 'str' is modified in-place.
  */
 int get_words(char *restrict str, int *restrict wcp, char **restrict words, int maxw) {
-#define INIT_LEN 10
 #define IS_SPACE_CHAR(c) (c == ' ' || c == '\t' || c == '\n')
     int wc = 0;
     if (str == NULL || wcp == NULL || words == NULL)
@@ -42,7 +45,7 @@ int get_words(char *restrict str, int *restrict wcp, char **restrict words, int 
 
     while (*str != '\0') {
         while (IS_SPACE_CHAR(*str) && *str != '\0')
-            *str = '\0';
+            *str++ = '\0';
 
         if (*str == '\0')
             break;
@@ -61,14 +64,18 @@ int get_words(char *restrict str, int *restrict wcp, char **restrict words, int 
 }
 
 int main(int argc, char *argv[]) {
+#ifdef TEST
+    return run_tests();
+#endif
+
     char *line = malloc(512 * sizeof(char));
     int wcount;
-    char **words;
+    char *words[MAX_ARGS];
     size_t n;
     while (1) {
         puts("adash>");
         getline(&line, &n, stdin);
-        if (-1 == get_words(line, &wcount, &words)) {
+        if (-1 == get_words(line, &wcount, words, MAX_ARGS)) {
             printf("Cannot parse command\n");
             continue;
         }
