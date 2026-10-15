@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <pwd.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -13,6 +14,35 @@
 #endif
 #define MAX_ARGS 1024
 extern char **environ;
+
+const int SIGNALS[] = {SIGINT, SIGTTIN, SIGTTOU};
+
+// Utils functions
+
+/*
+ * @brief Disable for the current process the signals defined in SIGNALS
+ * @return 0 on success
+ * @return -1 on error and set errno
+ */
+static inline int disable_signals() {
+    int count = sizeof(SIGNALS) / sizeof(SIGNALS[0]);
+    for (int i = 0; i < count; i++)
+        if (signal(SIGNALS[i], SIG_IGN) == SIG_ERR)
+            return -1;
+    return 0;
+}
+/*
+ * @brief Enable for the current process the signals defined in SIGNALS
+ * @return 0 on success
+ * @return -1 on error and set errno
+ */
+static inline int enable_signals() {
+    int count = sizeof(SIGNALS) / sizeof(SIGNALS[0]);
+    for (int i = 0; i < count; i++)
+        if (signal(SIGNALS[i], SIG_DFL) == SIG_ERR)
+            return -1;
+    return 0;
+}
 
 /*
  * @brief Print current working directory
@@ -111,20 +141,41 @@ int get_words(char *_Nonnull restrict str, int *_Nullable restrict wcp, char **_
 }
 /*
  * @brief create a new process
+ * Create a new process using fork and execvp. Enable all the signals.
+ * @param args[in] array of strings with the program and its arguments. The first string should be the program
+ * name.
+ * @param stop[in] if true send SIGSTOP just before execvp
+ * @param pgid[in] Set the pgid. If 0 the pgid will be the pid of the new process. If -1 pgid will not be
+ * edited.
+ *
+ * @return -1 on error, sets errno
+ * @return pid of the new process to the father
+ * @noreturn for the child.
  */
-int init_process(char *_Nonnull args[], int stop) {
-    assert(args != NULL);
+int init_process(char *_Nonnull args[], int stop, int pgid) {
+    if (pgid < -1) {
+        errno = EINVAL;
+        return -1;
+    }
     if (args[0] == NULL)
         return 0;
+
     int pid = fork();
     if (pid == -1)
         return -1;
     if (pid != 0)
         return pid;
 
-    signal(SIGTTOU, SIG_DFL);
-    signal(SIGTTIN, SIG_DFL);
-    signal(SIGINT, SIG_DFL);
+    if (-1 == enable_signals()) {
+        perror("Child cannot enable signals");
+        exit(1);
+    }
+    if (pgid != -1)
+        if (setpgid(0, pgid) == -1) {
+            perror("Child cannot change pgid");
+            exit(1);
+        }
+
     if (stop)
         raise(SIGSTOP);
 
@@ -134,45 +185,68 @@ int init_process(char *_Nonnull args[], int stop) {
 }
 
 /*
- * must be called after init_process by the father
+ * @brief Set the TTY (described by STDIN) foregroud group to pgid
+ * @return 0 on success
+ * @return 1 on error
  */
-int process_to_fg(int pid) {
-    assert(pid != -1);
-    assert(pid != 0);
-    if (setpgid(pid, pid) == -1)
+int connect_TTY(int pgid) {
+    assert(pgid >= 0);
+    if (tcsetpgrp(STDIN_FILENO, pgid) == -1)
         return -1;
-    if (tcsetpgrp(STDIN_FILENO, pid) == -1)
-        return -1;
-    return pid;
+    return 0;
 }
 
 /*
- * I use this design instead of the suggested design from POSIX/GNU
- * developers of repeated calls in the father and in the children
- * of setpgid and tcsetpgrp. The overhead from the raise(SIGSTOP) and
- * kill is trascurable compared to the execution time of fork and execve.
- * With this design the code is more organized and the functions can be reused
- * also for the creation of background processes, so reducing the space for
- * errors
+ * @brief Wait for SIGSTOP of a process and send SIGCONT after.
+ * @note if waitpid return a status different from WIFSTOPPED the procedure
+ * will return succes without sending any signal.
+ *
+ * @param pid Process id to wait
+ * @return 0 on success
+ * @return -1 on error. Sets errno.
  */
-int run_process_fg(char *_Nonnull argv[]) {
-    assert(argv != NULL);
-    if (argv[0] == NULL)
-        return 0;
-    int pid = init_process(argv, 1);
+int wawakep(int pid) {
     int wstatus;
-    if (pid == -1)
-        return -1;
-    if (process_to_fg(pid) == -1)
-        return -1;
     if (-1 == waitpid(pid, &wstatus, WUNTRACED))
         return -1;
     if (WIFSTOPPED(wstatus))
         if (-1 == kill(pid, SIGCONT))
             return -1;
-    if (waitpid(pid, NULL, 0) == -1)
+    return 0;
+}
+
+/*
+ * @brief Run the program defined in argv[0] with args argv[1:...] in foreground. Wait for
+ * the program to exit.
+ *
+ * @note I use this design instead of the suggested design from POSIX/GNU
+ * of repeated calls in the father and in the children
+ * of setpgid and tcsetpgrp. The overhead from the raise(SIGSTOP) and
+ * kill is trascurable compared to the execution time of fork and execve.
+ * With this design the code is more organized and the functions can be reused
+ * also for the creation of background processes, so reducing the space for
+ * errors
+ *
+ * @return exit code of the executed program
+ * @return -1 on error
+ *
+ * @warning If argv[0] == NULL no program will be executed and 0 will be returned
+ */
+int rprocfg_wait(char *_Nonnull argv[]) {
+    int wstatus, pid;
+    assert(argv != NULL);
+    if (argv[0] == NULL)
+        return 0;
+    pid = init_process(argv, 1, 0);
+    if (pid == -1)
         return -1;
-    return pid;
+    if (connect_TTY(pid) == -1)
+        return -1;
+    if (wawakep(pid) == -1)
+        return -1;
+    if (waitpid(pid, &wstatus, 0) == -1)
+        return -1;
+    return WEXITSTATUS(wstatus);
 }
 
 /*
@@ -197,9 +271,10 @@ int main(int argc, char *argv[]) {
     char *line = malloc(512 * sizeof(char));
     char *args[MAX_ARGS];
     size_t n = 512;
-    signal(SIGTTOU, SIG_IGN);
-    signal(SIGTTIN, SIG_IGN);
-    signal(SIGINT, SIG_IGN);
+    if (-1 == disable_signals()) {
+        perror("Cannot disable signals");
+        exit(1);
+    }
     while (1) {
         if (-1 == print_query()) {
             perror("Cannot print query");
@@ -212,12 +287,12 @@ int main(int argc, char *argv[]) {
         }
         if (exec_shell_cmd(args) != 0)
             continue;
-        if (-1 == run_process_fg(args)) {
-            perror("");
+        if (-1 == rprocfg_wait(args)) {
+            perror("Error while executing new process");
             continue;
         }
-        if (-1 == tcsetpgrp(STDIN_FILENO, getpgrp())) {
-            perror("");
+        if (connect_TTY(getpgrp()) == -1) {
+            perror("Dash cannot reconnect to TTY");
             exit(1);
         }
     }
