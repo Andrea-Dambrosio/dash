@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <errno.h>
+#include <linux/limits.h>
 #include <pwd.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -48,22 +49,40 @@ static inline int enable_signals() {
  * @return A string pointer to the PWD env variable value on success.
  * @return NULL on error, you can read errno
  */
+char *PWD = NULL;
 char *getpwd() {
-    static char *pwd = NULL;
-    if (pwd != NULL)
-        return pwd;
-    pwd = getenv("PWD");
-    if (pwd == NULL) {
-        pwd = getcwd(NULL, 0);
-        if (pwd == NULL)
+    if (PWD != NULL)
+        return PWD;
+    PWD = getenv("PWD");
+    if (PWD == NULL) {
+        PWD = getcwd(NULL, 0);
+        if (PWD == NULL)
             return NULL;
-        setenv("PWD", pwd, 1);
-        free(pwd);
+        setenv("PWD", PWD, 1);
+        free(PWD);
     }
-    pwd = getenv("PWD");
-    return pwd;
+    PWD = getenv("PWD");
+    return PWD;
 }
 
+/*
+ * @brief Set pwd
+ * @return 0 on succes
+ * @return -1 on error. Sets errno.
+ */
+int setpwd(char *path) {
+    char *curr = getpwd();
+    if (chdir(path) == -1)
+        return -1;
+    if (setenv("PWD", path, 1) == -1)
+        return -1;
+    if (curr != NULL)
+        if (setenv("OLDPWD", curr, 1) == -1)
+            return -1;
+    PWD = getenv("PWD");
+    assert(PWD != NULL);
+    return 0;
+}
 /*
  * @brief Print current user (not effective user)
  * @warning if the user change after the first call, the user will not be updated.
@@ -279,19 +298,82 @@ int rprocfg_wait(char *_Nonnull argv[]) {
     return WEXITSTATUS(wstatus);
 }
 
-int cd(char *argv[]) {
-    int i, lst;
-    char *currdir = getpwd();
-    if (argv[2] != NULL)
-        fputs("Too many arguments\n", stdout);
-    char targetdir[strlen(currdir) + strlen(argv[1]) + 1];
+/*
+ * @brief Parse a path, create a clean path without '..', '.' and ''
+ * @return 0 on success
+ * @return -1 on error (only if the string contains more than STACK_SIZE tokens). Sets errno
+ * @warning The escape char and the '"' char are not managed here
+ */
+int clean_path(char *path) {
+    const int STACK_SIZE = 256;
+    char *stack[STACK_SIZE];
+    char tmp[strlen(path) + 1];
+    int top = 0;
 
-    strcpy(targetdir, argv[2]);
-    strcat(targetdir, currdir);
-    i = 0, lst = 0;
-
-    while (targetdir[i] != '\0') {
+    char *tok = strtok(path, "/");
+    while (tok != NULL) {
+        if (strcmp(tok, ".") == 0)
+            goto next;
+        if (strcmp(tok, "..") == 0) {
+            top = top > 0 ? top - 1 : 0;
+            goto next;
+        }
+        if (top > STACK_SIZE) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        stack[top++] = tok;
+    next:
+        tok = strtok(NULL, "/");
     }
+
+    tmp[0] = '\0';
+    for (int i = 0; i < top; i++) {
+        strcat(tmp, "/");
+        strcat(tmp, stack[i]);
+    }
+    strcpy(path, tmp);
+    return 0;
+}
+
+/*
+ * @brief Implements the cd command.
+ * Change the current logical directory to the user interface.
+ * Resolve the logical path and sets the physical directory for the process.
+ * @param[in] path The relative (or absolute) path to go.
+ * @return 0 on succes
+ * @return -1 on error. Sets errno
+ * @warning This function uses PATH_MAX, it may cause problem in some use cases.
+ */
+int cd(char *path) {
+    char *currdir, buff[PATH_MAX + 1];
+    char *target;
+    currdir = getpwd();
+    if (currdir == NULL)
+        return -1;
+    if (path == NULL || *path == '\0') {
+        target = getenv("HOME");
+        target = target == NULL ? "/" : target;
+        goto chdir;
+    }
+    if (strcmp(path, "-") == 0) {
+        target = getenv("OLDPWD");
+        target = target != NULL ? target : currdir;
+        goto chdir;
+    }
+    if (path[0] == '/') {
+        target = path;
+        if (-1 == clean_path(target))
+            return -1;
+        goto chdir;
+    }
+    snprintf(buff, PATH_MAX + 1, "%s/%s", currdir == NULL ? "" : currdir, path);
+    target = buff;
+    if (-1 == clean_path(target))
+        return -1;
+
+chdir:
+    return setpwd(target);
 }
 
 /*
@@ -307,7 +389,13 @@ int exec_shell_cmd(char *_Nonnull argv[]) {
     if (strcmp(argv[0], "exit") == 0)
         exit(1);
     if (strcmp(argv[0], "cd") == 0) {
-        cd(argv);
+        if (argv[2] != NULL)
+            fprintf(stderr, "Too much arguments\n");
+        if (cd(argv[1]) == -1) {
+            perror("cd");
+            return -1;
+        }
+        return 1;
     }
     return 0;
 }
