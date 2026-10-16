@@ -13,7 +13,6 @@
 #include "tests.c"
 #endif
 #define MAX_ARGS 1024
-extern char **environ;
 
 const int SIGNALS[] = {SIGINT, SIGTTIN, SIGTTOU};
 
@@ -45,19 +44,24 @@ static inline int enable_signals() {
 }
 
 /*
- * @brief Print current working directory
- * @return 0 on success.
- * @return -1 on error. You can read errno.
+ * @brief Return current working directory
+ * @return A string pointer to the PWD env variable value on success.
+ * @return NULL on error, you can read errno
  */
-int print_cwd() {
-    char *wd;
-    wd = getcwd(NULL, 0);
-    if (wd == NULL)
-        return -1;
-    if (fputs(wd, stdout) == EOF)
-        return -1;
-    free(wd);
-    return 0;
+char *getpwd() {
+    static char *pwd = NULL;
+    if (pwd != NULL)
+        return pwd;
+    pwd = getenv("PWD");
+    if (pwd == NULL) {
+        pwd = getcwd(NULL, 0);
+        if (pwd == NULL)
+            return NULL;
+        setenv("PWD", pwd, 1);
+        free(pwd);
+    }
+    pwd = getenv("PWD");
+    return pwd;
 }
 
 /*
@@ -89,50 +93,76 @@ int print_query() {
         return -1;
     if (putchar(':') == -1)
         return -1;
-    if (print_cwd() == -1)
+    if (fputs(getpwd(), stdout) == EOF)
         return -1;
     if (fputs("> ", stdout) == EOF)
         return -1;
     return 0;
 }
 /*
- * @brief Divide the string 'str' string using ' ' as separator.
+ * @brief Split the string 'str' string using 'sep' as separator.
+ * Supports the escape char and '"'
  *
  * Scans the string and return a null terminated array of words that point to the same
  * memory location of the input string. '\0' is inserted instead of ' '.
- * The words are trimmed.
+ * All escape chars are removed, a char after \ is not evaluated.
+ * The a string inside the " " is copied without the '"'. If the closing " is missing everything is copied
+ * until the end. The words are trimmed.
  *
  * @param[in,out] str           Null terminated string to parse. Must be a mutable string.
  * @param[out]  wcp             Words inside the string
  * @param[out]  words           A pointer to an array of strings pre allocated.
  * @param[in]   maxw            Size of the words array
+ * @param[in]   sep             Separator of the words
  *
  * @return 0 on success
- * @return -1 on error
+ * @return -1 on error. Sets errno.
  *
  * @warning 'str' is modified in-place.
  */
-int get_words(char *_Nonnull restrict str, int *_Nullable restrict wcp, char **_Nonnull restrict words,
-              int maxw) {
-#define IS_SPACE_CHAR(c) (c == ' ' || c == '\t' || c == '\n')
+
+int splitstr(char *_Nonnull restrict str, int *_Nullable restrict wcp, char **_Nonnull restrict words,
+             int maxw, char sep) {
+#define IS_SEP_CHAR(c, s) ((c) == '\t' || (c) == '\n' || (c) == (s))
     int wc = 0;
-    if (str == NULL || words == NULL)
+    char *r, *w;
+    if (str == NULL || words == NULL || maxw <= 0) {
+        errno = EINVAL;
         return -1;
+    }
+    r = str;
+    w = str;
+    while (*r != '\0') {
+        while (*r != '\0' && IS_SEP_CHAR(*r, sep))
+            r++;
 
-    while (*str != '\0') {
-        while (IS_SPACE_CHAR(*str) && *str != '\0')
-            *str++ = '\0';
-
-        if (*str == '\0')
+        if (*r == '\0')
             break;
 
-        words[wc++] = str;
+        words[wc++] = w;
         if (wc >= maxw) {
-            fprintf(stderr, "Too much arguments.\n");
+            errno = E2BIG;
             return -1;
         }
-        while (!IS_SPACE_CHAR(*str) && *str != '\0')
-            str++;
+        while (*r != '\0' && !IS_SEP_CHAR(*r, sep)) {
+            if (*r == '\\') {
+                r++;
+                if (*r == '\0')
+                    break;
+            } else if (*r == '"') {
+                r++;
+                while (*r != '\0' && *r != '\n' && *r != '"')
+                    *w++ = *r++;
+                if (*r == '"')
+                    r++;
+                continue;
+            }
+
+            *w++ = *r++;
+        }
+        if (*r != '\0')
+            r++;
+        *w++ = '\0';
     }
     words[wc] = NULL;
     if (wcp != NULL)
@@ -142,8 +172,8 @@ int get_words(char *_Nonnull restrict str, int *_Nullable restrict wcp, char **_
 /*
  * @brief create a new process
  * Create a new process using fork and execvp. Enable all the signals.
- * @param args[in] array of strings with the program and its arguments. The first string should be the program
- * name.
+ * @param args[in] array of strings with the program and its arguments. The first string should be the
+ * program name.
  * @param stop[in] if true send SIGSTOP just before execvp
  * @param pgid[in] Set the pgid. If 0 the pgid will be the pid of the new process. If -1 pgid will not be
  * edited.
@@ -249,6 +279,21 @@ int rprocfg_wait(char *_Nonnull argv[]) {
     return WEXITSTATUS(wstatus);
 }
 
+int cd(char *argv[]) {
+    int i, lst;
+    char *currdir = getpwd();
+    if (argv[2] != NULL)
+        fputs("Too many arguments\n", stdout);
+    char targetdir[strlen(currdir) + strlen(argv[1]) + 1];
+
+    strcpy(targetdir, argv[2]);
+    strcat(targetdir, currdir);
+    i = 0, lst = 0;
+
+    while (targetdir[i] != '\0') {
+    }
+}
+
 /*
  * @brief check if argv contains a shell command and execute it
  * @return 1 if the execution succeed
@@ -261,6 +306,9 @@ int exec_shell_cmd(char *_Nonnull argv[]) {
         return 0;
     if (strcmp(argv[0], "exit") == 0)
         exit(1);
+    if (strcmp(argv[0], "cd") == 0) {
+        cd(argv);
+    }
     return 0;
 }
 
@@ -281,7 +329,7 @@ int main(int argc, char *argv[]) {
             exit(1);
         }
         getline(&line, &n, stdin);
-        if (-1 == get_words(line, NULL, args, MAX_ARGS)) {
+        if (-1 == splitstr(line, NULL, args, MAX_ARGS, ' ')) {
             printf("Cannot parse command\n");
             continue;
         }
